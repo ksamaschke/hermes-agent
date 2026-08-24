@@ -2405,13 +2405,8 @@ class MatrixAdapter(BasePlatformAdapter):
                     "Matrix: initial key share failed (%s)",
                     type(exc).__name__,
                 )
-            if (
-                self._e2ee_recipient_enforcement_active
-                and not await self._reconcile_encrypted_rooms()
-            ):
-                logger.error("Matrix: refusing readiness after encrypted-room reconciliation failure")
-                await self._disconnect_impl()
-                return False
+            if self._e2ee_recipient_enforcement_active:
+                await self._reconcile_encrypted_rooms_before_ready()
 
         # Start the sync loop.
         self._sync_task = asyncio.create_task(self._sync_loop())
@@ -2858,6 +2853,16 @@ class MatrixAdapter(BasePlatformAdapter):
                 str(persisted_session.id),
                 set(targets),
             )
+
+    async def _reconcile_encrypted_rooms_before_ready(self) -> bool:
+        """Reconcile rooms without taking the whole Matrix client offline."""
+        reconciled = await self._reconcile_encrypted_rooms()
+        if not reconciled:
+            logger.error(
+                "Matrix: encrypted-room key reconciliation failed; "
+                "keeping Matrix connected while encrypted sends remain fail-closed"
+            )
+        return reconciled
 
     async def _reconcile_encrypted_rooms(self) -> bool:
         """Re-share active Megolm sessions after initial sync/reconnect."""

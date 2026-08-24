@@ -484,3 +484,18 @@ def test_matrix_exception_summary_redacts_credentials():
     assert "password@example.org" not in summary
     assert "query-secret" not in summary
     assert "[REDACTED]" in summary
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_failure_does_not_disconnect_gateway():
+    adapter, _session, _store, _crypto = make_adapter()
+    adapter._reconcile_encrypted_rooms = AsyncMock(return_value=False)
+
+    # The gateway must stay connected so Matrix sync and room-key requests can
+    # repair the room. Outbound encrypted sends still call the readiness gate
+    # and fail closed until recipients are verified.
+    reconciled = await adapter._reconcile_encrypted_rooms_before_ready()
+
+    assert reconciled is False
+    adapter._reconcile_encrypted_rooms.assert_awaited_once_with()
+    assert adapter._matrix_client_connected is True
