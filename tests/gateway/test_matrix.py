@@ -1431,12 +1431,17 @@ class TestMatrixUploadAndSend:
         adapter = _make_adapter()
         adapter._encryption = True
         mock_client = MagicMock()
-        mock_client.crypto = object()
         mock_client.state_store = MagicMock()
         mock_client.state_store.is_encrypted = AsyncMock(return_value=True)
+        mock_client.crypto = types.SimpleNamespace(state_store=mock_client.state_store)
         mock_client.upload_media = AsyncMock(return_value="mxc://example.org/enc")
         mock_client.send_message_event = AsyncMock(return_value="$event")
         adapter._client = mock_client
+        adapter._e2ee_machine_active = True
+        adapter._matrix_client_connected = True
+        adapter._matrix_client_lifecycle_active = True
+        adapter._matrix_client_runtime_bound = True
+        adapter._ensure_encrypted_room_ready = AsyncMock()
 
         with patch.dict("sys.modules", _make_fake_mautrix()):
             result = await adapter._upload_and_send(
@@ -1477,6 +1482,42 @@ class TestMatrixUploadAndSend:
         assert sent["m.relates_to"]["rel_type"] == "m.thread"
         assert sent["m.relates_to"]["event_id"] == "$root"
         assert sent["m.relates_to"]["m.in_reply_to"] == {"event_id": "$root"}
+
+    @pytest.mark.asyncio
+    async def test_media_upload_timeout_returns_failure(self):
+        adapter = _make_adapter()
+        adapter._media_upload_timeout_seconds = 0.01
+        adapter._encryption = False
+        mock_client = MagicMock()
+
+        async def slow_upload(*_args, **_kwargs):
+            await asyncio.sleep(1)
+
+        mock_client.upload_media = AsyncMock(side_effect=slow_upload)
+        adapter._client = mock_client
+
+        result = await adapter._upload_and_send(
+            "!room:example.org", b"image", "chart.png", "image/png", "m.image"
+        )
+
+        assert result.success is False
+        mock_client.upload_media.assert_awaited_once()
+
+
+    @pytest.mark.asyncio
+    async def test_invite_blocks_when_runtime_is_not_connected(self):
+        adapter = _make_adapter()
+        mock_client = MagicMock()
+        mock_client.invite_user = AsyncMock()
+        adapter._client = mock_client
+        adapter._matrix_client_runtime_bound = True
+        adapter._matrix_client_lifecycle_active = True
+        adapter._matrix_client_connected = False
+
+        result = await adapter.invite_user("!room:example.org", "@alice:example.org")
+
+        assert result is False
+        mock_client.invite_user.assert_not_awaited()
 
 
 class TestMatrixDiagnostics:
@@ -1597,6 +1638,9 @@ class TestMatrixEncryptedSendFallback:
         """send() should retry with crypto.share_keys() on E2EE errors."""
         adapter = _make_adapter()
         adapter._encryption = True
+        adapter._matrix_client_runtime_bound = True
+        adapter._matrix_client_lifecycle_active = True
+        adapter._matrix_client_connected = True
 
         fake_client = MagicMock()
         fake_client.send_message_event = AsyncMock(side_effect=[
@@ -1607,6 +1651,7 @@ class TestMatrixEncryptedSendFallback:
         mock_crypto.share_keys = AsyncMock()
         fake_client.crypto = mock_crypto
         adapter._client = fake_client
+        adapter._ensure_encrypted_room_ready = AsyncMock()
 
         result = await adapter.send("!room:example.org", "hello")
 
@@ -1614,6 +1659,26 @@ class TestMatrixEncryptedSendFallback:
         assert result.message_id == "$event123"
         mock_crypto.share_keys.assert_awaited_once()
         assert fake_client.send_message_event.await_count == 2
+
+
+    @pytest.mark.asyncio
+    async def test_send_timeout_returns_failure(self):
+        adapter = _make_adapter()
+        adapter._encryption = False
+        adapter._matrix_request_timeout_seconds = 0.01
+        fake_client = MagicMock()
+
+        async def slow_send(*_args, **_kwargs):
+            await asyncio.sleep(1)
+
+        fake_client.send_message_event = AsyncMock(side_effect=slow_send)
+        fake_client.crypto = None
+        adapter._client = fake_client
+
+        result = await adapter.send("!room:example.org", "hello")
+
+        assert result.success is False
+        fake_client.send_message_event.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -2744,7 +2809,7 @@ class TestMatrixReconnectDisconnect:
         adapter._client.api.session.close = AsyncMock()
         adapter._client.whoami = AsyncMock()
 
-        adapter.disconnect = AsyncMock()
+        adapter._disconnect_impl = AsyncMock()
 
         fake_mautrix_mods = _make_fake_mautrix()
 
@@ -2774,7 +2839,7 @@ class TestMatrixReconnectDisconnect:
                 with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
                     await adapter.connect()
 
-        adapter.disconnect.assert_awaited_once()
+        adapter._disconnect_impl.assert_awaited_once()
 
 
 class TestDeviceIdRecoveryOnReconnect:

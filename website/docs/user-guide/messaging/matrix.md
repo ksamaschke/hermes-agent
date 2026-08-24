@@ -405,6 +405,20 @@ When E2EE is enabled, Hermes:
 - Uploads device keys on first connection
 - Decrypts incoming messages and encrypts outgoing messages automatically
 - Auto-joins encrypted rooms when invited
+- Re-queries encrypted-room peer devices after reconnect and before sends, then re-shares the persisted Megolm session to current devices
+- Refuses to send encrypted ciphertext when no actual to-device key recipients were produced
+
+Mautrix handles incoming `m.room_key_request` events automatically from the
+persisted crypto store. Hermes records the encrypted to-device targets prepared
+by the outbound share path and refuses to mark a session usable when the
+homeserver accepted zero recipient key messages. This verifies the local
+payload/send operation, not that a remote client has rendered the message. The
+refresh interval is controlled by
+`matrix.device_refresh_seconds` in `config.yaml` (default `300`; set to `0` to
+refresh on every encrypted readiness check). Lifecycle-fenced Matrix requests
+default to 45 seconds and media uploads default to 120 seconds; configure
+`matrix.request_timeout_seconds` and `matrix.media_upload_timeout_seconds`
+when the homeserver or media path needs different bounds.
 
 ### Matrix Tools and Controls
 

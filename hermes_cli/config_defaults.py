@@ -2381,6 +2381,9 @@ DEFAULT_CONFIG = {
         "require_mention": True,       # Require @mention to respond in rooms
         "free_response_rooms": "",     # Comma-separated room IDs where bot responds without mention
         "allowed_rooms": "",           # If set, bot ONLY responds in these room IDs (whitelist)
+        "device_refresh_seconds": 300, # Peer device-list refresh interval; 0 refreshes every encrypted readiness check
+        "request_timeout_seconds": 45,  # Lifecycle-fenced Matrix request timeout
+        "media_upload_timeout_seconds": 120,  # Lifecycle-fenced media upload timeout
     },
 
     # Approval mode for dangerous commands:

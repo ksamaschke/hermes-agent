@@ -47,6 +47,9 @@ Environment variables:
                               when requester metadata is available (default: true)
     MATRIX_APPROVAL_TIMEOUT_SECONDS
                               Reaction approval/model-picker timeout (default: 300)
+    MATRIX_DEVICE_REFRESH_SECONDS
+                              Minimum seconds between peer device-list refreshes
+                              before encrypted sends (default: 300; 0 refreshes every time)
 """
 
 from __future__ import annotations
@@ -179,7 +182,7 @@ def _matrix_voice_metadata_for_file(path: Path) -> Dict[str, Any]:
                 if duration > 0:
                     metadata["duration"] = int(duration * 1000)
         except Exception:
-            logger.debug("Matrix: failed to probe voice duration for %s", path, exc_info=True)
+            logger.debug("Matrix: failed to probe voice duration for %s", path)
 
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg:
@@ -218,7 +221,7 @@ def _matrix_voice_metadata_for_file(path: Path) -> Dict[str, Any]:
                         waveform.append(min(1024, int(peak / 32767 * 1024)))
                     metadata["waveform"] = waveform
         except Exception:
-            logger.debug("Matrix: failed to build voice waveform for %s", path, exc_info=True)
+            logger.debug("Matrix: failed to build voice waveform for %s", path)
 
     return metadata
 
@@ -267,7 +270,7 @@ def _matrix_transcode_voice_to_ogg(path: str) -> Optional[str]:
         if result.returncode == 0 and os.path.getsize(ogg_path) > 0:
             return ogg_path
     except Exception:
-        logger.debug("Matrix: voice transcode to Ogg/Opus failed for %s", path, exc_info=True)
+        logger.debug("Matrix: voice transcode to Ogg/Opus failed for %s", path)
     try:
         os.unlink(ogg_path)
     except OSError:
@@ -314,7 +317,7 @@ def _resolve_matrix_bang_command(name: str) -> str | None:
                 return candidate
     except Exception:
         logger.debug(
-            "Matrix: is_gateway_known_command failed for %r", name, exc_info=True
+            "Matrix: is_gateway_known_command failed for %r", name
         )
 
     try:
@@ -327,7 +330,7 @@ def _resolve_matrix_bang_command(name: str) -> str | None:
             if f"/{candidate}" in skill_commands:
                 return candidate
     except Exception:
-        logger.debug("Matrix: get_skill_commands failed for %r", name, exc_info=True)
+        logger.debug("Matrix: get_skill_commands failed for %r", name)
 
     return None
 
@@ -776,7 +779,7 @@ def _create_matrix_session(proxy_url: str | None):
             logger.warning(
                 "aiohttp_socks not installed — SOCKS proxy %s ignored. "
                 "Run: pip install aiohttp-socks",
-                proxy_url,
+                _redact_url_for_log(proxy_url),
             )
             return aiohttp.ClientSession(trust_env=True)
 
@@ -874,7 +877,7 @@ def _get_matrix_recovery_key_output_target() -> tuple[Optional[Path], str]:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
     except Exception as exc:
-        return None, f"unusable: {exc}"
+        return None, f"unusable:{type(exc).__name__}"
     return path, ""
 
 
@@ -893,10 +896,10 @@ def _handle_generated_matrix_recovery_key(mxid: str, recovery_key: str) -> None:
     except Exception as exc:
         logger.warning(
             "Matrix: bootstrapped cross-signing for %s, but failed to write "
-            "MATRIX_RECOVERY_KEY_OUTPUT_FILE: %s. Store the generated key "
+            "MATRIX_RECOVERY_KEY_OUTPUT_FILE: (%s). Store the generated key "
             "securely and set MATRIX_RECOVERY_KEY for future restarts.",
             mxid,
-            exc,
+            type(exc).__name__,
         )
         return
 
@@ -952,9 +955,38 @@ def _redact_url_for_log(url: str) -> str:
         parts = urlsplit(str(url))
         if not parts.scheme and not parts.netloc:
             return str(url).split("?", 1)[0].split("#", 1)[0]
-        return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+        host = parts.hostname or ""
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        if parts.port:
+            host = f"{host}:{parts.port}"
+        return urlunsplit((parts.scheme, host, parts.path, "", ""))
     except Exception:
         return "<url>"
+
+
+def _matrix_exception_summary(exc: BaseException) -> str:
+    """Return a bounded Matrix error summary without credential material."""
+    text = str(exc or "")
+    text = re.sub(r"(?i)Bearer\s+\S+", "Bearer [REDACTED]", text)
+    text = re.sub(
+        r"(?i)(https?://)[^/\s:@]+:[^/\s@]+@",
+        r"\1[REDACTED]@",
+        text,
+    )
+    text = re.sub(
+        r"(?i)(access[_-]?token|api[_-]?key|password|secret|recovery[_-]?key)"
+        r"([\s\"']*[:=][\s\"']*)[^,;}\s\"']+",
+        r"\1\2[REDACTED]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)([?&\s])token([\s\"']*=[\s\"']*)[^&\s,;}\"']+",
+        r"\1token\2[REDACTED]",
+        text,
+    )
+    text = text.replace("\n", " ")
+    return f"{type(exc).__name__}: {text[:300]}"
 
 
 def _pre_sanitize_matrix_markdown(text: str) -> str:
@@ -1049,7 +1081,7 @@ def ensure_matrix_deps() -> bool:
         from tools.lazy_deps import feature_missing, ensure_and_bind
         missing = feature_missing("platform.matrix")
     except Exception as exc:  # pragma: no cover — defensive
-        logger.debug("Matrix: lazy_deps lookup failed: %s", exc)
+        logger.debug("Matrix: lazy_deps lookup failed (%s)", type(exc).__name__)
         missing = ()
         ensure_and_bind = None  # type: ignore[assignment]
 
@@ -1102,6 +1134,10 @@ def ensure_matrix_deps() -> bool:
     return True
 
 
+class _MatrixStateInspectionError(RuntimeError):
+    """The homeserver state could not be inspected, not an unencrypted room."""
+
+
 class _CryptoStateStore:
     """Adapter that satisfies the mautrix crypto StateStore interface.
 
@@ -1126,37 +1162,60 @@ class _CryptoStateStore:
     async def is_encrypted(self, room_id: str) -> bool:
         return (await self.get_encryption_info(room_id)) is not None
 
-    async def get_encryption_info(self, room_id: str):
+    async def get_encryption_info(
+        self, room_id: str, *, authoritative: bool = False
+    ):
         info = None
-        if hasattr(self._ss, "get_encryption_info"):
+        if not authoritative and hasattr(self._ss, "get_encryption_info"):
             info = await self._ss.get_encryption_info(room_id)
         if info is not None:
             return info
         # Check local cache before hitting the homeserver.
-        if room_id in self._enc_info_cache:
+        if not authoritative and room_id in self._enc_info_cache:
             return self._enc_info_cache[room_id]
         client = self._client
         if client is None:
             return None
         try:
-            from mautrix.types import (
-                EventType as _ET,
-                RoomEncryptionStateEventContent as _Enc,
-                RoomID as _RID,
+            from mautrix.errors import MNotFound
+        except ImportError:
+            MNotFound = None
+        try:
+            raw = await client.get_state_event(
+                RoomID(room_id),
+                getattr(EventType, "ROOM_ENCRYPTION", "m.room.encryption"),
             )
-            raw = await client.get_state_event(_RID(room_id), _ET.ROOM_ENCRYPTION)
         except Exception as exc:
+            if MNotFound is not None and isinstance(exc, MNotFound):
+                return None
             logger.debug(
-                "Matrix: homeserver encryption-info query failed for %s: %s",
+                "Matrix: homeserver encryption-info query failed for %s (%s)",
                 room_id,
-                exc,
+                type(exc).__name__,
             )
-            return None
-        if not raw:
-            return None
-        content = raw if isinstance(raw, _Enc) else _Enc.deserialize(
-            raw.serialize() if hasattr(raw, "serialize") else raw
-        )
+            raise _MatrixStateInspectionError(
+                f"Unable to inspect Matrix encryption state for {room_id}"
+            ) from exc
+        if raw is None:
+            raise _MatrixStateInspectionError(
+                f"Matrix encryption state response was empty for {room_id}"
+            )
+        try:
+            if getattr(raw, "algorithm", None):
+                content = raw
+            else:
+                serialized = raw.serialize() if hasattr(raw, "serialize") else raw
+                if not isinstance(serialized, dict) or not serialized.get("algorithm"):
+                    raise ValueError("Matrix encryption state content lacked an algorithm")
+                content = serialized
+        except Exception as exc:
+            raise _MatrixStateInspectionError(
+                f"Matrix encryption state response was invalid for {room_id}"
+            ) from exc
+        if not getattr(content, "algorithm", None):
+            raise _MatrixStateInspectionError(
+                f"Matrix encryption state response lacked an algorithm for {room_id}"
+            )
         if hasattr(self._ss, "set_encryption_info"):
             try:
                 await self._ss.set_encryption_info(_RID(room_id), content)
@@ -1168,6 +1227,72 @@ class _CryptoStateStore:
     async def find_shared_rooms(self, user_id: str) -> list:
         # Return all joined rooms — simple but correct for a single-user bot.
         return list(self._joined_rooms)
+
+
+try:
+    from mautrix.crypto.encrypt_megolm import SessionShareError as _MatrixSessionShareError
+except ImportError:
+    # Keep the adapter importable with lightweight Matrix test doubles.
+    class _MatrixSessionShareError(RuntimeError):
+        pass
+
+
+def _build_hermes_olm_machine(base_cls: Any) -> Any:
+    """Add recipient verification around mautrix's Megolm share operation.
+
+    ``OutboundGroupSession.from_pickle()`` intentionally does not persist its
+    in-memory ``users_shared_with`` set. After a gateway restart, mautrix can
+    therefore see ``shared=True`` while having no evidence that the current
+    peer devices received the room key. Its normal success log is also emitted
+    when the effective recipient set is empty. Keep the upstream crypto
+    implementation, but record actual encrypted to-device recipients and fail
+    closed when none were produced.
+    """
+    class HermesOlmMachine(base_cls):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._hermes_last_share_targets: Dict[
+                str, tuple[str, Set[tuple[str, str, str]]]
+            ] = {}
+
+        async def _encrypt_and_share_group_session(self, session: Any, olm_sessions: Any):
+            targets = {
+                (
+                    str(user_id),
+                    str(device_id),
+                    str(getattr(device_identity, "identity_key", "")),
+                )
+                for user_id, devices in olm_sessions.items()
+                for device_id, (_olm_session, device_identity) in devices.items()
+            }
+            self._hermes_last_share_targets[str(session.room_id)] = (
+                str(session.id),
+                targets,
+            )
+            return await super()._encrypt_and_share_group_session(session, olm_sessions)
+
+        async def share_group_session(self, room_id: Any, users: list[Any]) -> None:
+            room_key = str(room_id)
+            self._hermes_last_share_targets.pop(room_key, None)
+            await super().share_group_session(room_id, users)
+            share_record = self._hermes_last_share_targets.get(room_key)
+            targets = share_record[1] if share_record else set()
+            if not targets:
+                # Mautrix has already persisted the session as shared. Remove
+                # that false-positive state so a later send can retry instead
+                # of emitting ciphertext that no peer can decrypt.
+                await self.crypto_store.remove_outbound_group_sessions([room_id])
+                raise _MatrixSessionShareError(
+                    f"No encrypted to-device recipients for room {room_id}"
+                )
+            self.log.info(
+                "Matrix: prepared Megolm key share for %s to %d device target(s) across %d user(s)",
+                room_id,
+                len(targets),
+                len({user_id for user_id, _, _ in targets}),
+            )
+
+    return HermesOlmMachine
 
 
 class MatrixAdapter(BasePlatformAdapter):
@@ -1233,6 +1358,45 @@ class MatrixAdapter(BasePlatformAdapter):
         self._late_grace_skew: float = 0.0
         self._clock_skew_warned: bool = False
         self._last_sync_ts: float = 0.0
+
+        # Refresh peer device lists before encrypted sends. mautrix only
+        # invalidates a peer cache when a one-shot device_lists.changed sync
+        # signal is observed; a missed signal can leave room keys targeted at
+        # dead devices indefinitely.
+        self._device_refresh_ts: Dict[str, float] = {}
+        device_refresh_raw = config.extra.get("device_refresh_seconds")
+        if device_refresh_raw is None:
+            device_refresh_raw = os.getenv("MATRIX_DEVICE_REFRESH_SECONDS", "300")
+        try:
+            self._device_refresh_interval = float(device_refresh_raw)
+        except (TypeError, ValueError):
+            self._device_refresh_interval = 300.0
+        try:
+            request_timeout_raw = config.extra.get("request_timeout_seconds")
+            if request_timeout_raw is None:
+                request_timeout_raw = 45
+            self._matrix_request_timeout_seconds = max(1.0, float(request_timeout_raw))
+        except (TypeError, ValueError):
+            self._matrix_request_timeout_seconds = 45.0
+        try:
+            media_timeout_raw = config.extra.get("media_upload_timeout_seconds")
+            if media_timeout_raw is None:
+                media_timeout_raw = 120
+            self._media_upload_timeout_seconds = max(1.0, float(media_timeout_raw))
+        except (TypeError, ValueError):
+            self._media_upload_timeout_seconds = 120.0
+        self._e2ee_share_lock = asyncio.Lock()
+        self._matrix_lifecycle_lock = asyncio.Lock()
+        self._e2ee_room_targets: Dict[
+            str, tuple[str, Set[tuple[str, str, str]]]
+        ] = {}
+        self._e2ee_machine_active = False
+        self._matrix_client_connected = False
+        self._matrix_client_lifecycle_active = False
+        self._matrix_client_runtime_bound = False
+        self._matrix_lifecycle_generation = 0
+        self._e2ee_recipient_enforcement_active = False
+        self._e2ee_readiness_tasks: Set[asyncio.Task] = set()
 
         # Cache: room_id → bool (is DM)
         self._dm_rooms: Dict[str, bool] = {}
@@ -1322,7 +1486,10 @@ class MatrixAdapter(BasePlatformAdapter):
         # Proxy support — resolve once at init, reuse for all HTTP traffic.
         self._proxy_url: str | None = resolve_proxy_url(platform_env_var="MATRIX_PROXY")
         if self._proxy_url:
-            logger.info("Matrix: proxy configured — %s", self._proxy_url)
+            logger.info(
+                "Matrix: proxy configured — %s",
+                _redact_url_for_log(self._proxy_url),
+            )
         try:
             self._max_media_bytes = int(os.getenv("MATRIX_MAX_MEDIA_BYTES", str(100 * 1024 * 1024)))
         except ValueError:
@@ -1375,9 +1542,9 @@ class MatrixAdapter(BasePlatformAdapter):
                 self._ignored_user_patterns.append(re.compile(pattern))
             except re.error as exc:
                 logger.warning(
-                    "Matrix: ignoring invalid MATRIX_IGNORE_USER_PATTERNS entry %r: %s",
+                    "Matrix: ignoring invalid MATRIX_IGNORE_USER_PATTERNS entry %r (%s)",
                     pattern,
-                    exc,
+                    type(exc).__name__,
                 )
 
     def _is_duplicate_event(self, event_id) -> bool:
@@ -1456,7 +1623,10 @@ class MatrixAdapter(BasePlatformAdapter):
             )
             return True
         try:
-            resp = await client.query_keys({client.mxid: [client.device_id]})
+            resp = await asyncio.wait_for(
+                client.query_keys({client.mxid: [client.device_id]}),
+                timeout=getattr(self, "_matrix_request_timeout_seconds", 45.0),
+            )
             dk = getattr(resp, "device_keys", {}) or {}
             ud = dk.get(str(client.mxid)) or {}
             dev = ud.get(str(client.device_id))
@@ -1471,7 +1641,10 @@ class MatrixAdapter(BasePlatformAdapter):
                     )
                     return False
         except Exception as exc:
-            logger.error("Matrix: post-upload key verification failed: %s", exc, exc_info=True)
+            logger.error(
+                "Matrix: post-upload key verification failed (%s)",
+                type(exc).__name__,
+            )
             return False
         return True
 
@@ -1492,7 +1665,7 @@ class MatrixAdapter(BasePlatformAdapter):
         try:
             stored_device_id = await crypto_store.get_device_id()
         except Exception as exc:
-            logger.warning("Matrix: could not read stored device ID: %s", exc)
+            logger.warning("Matrix: could not read stored device ID (%s)", type(exc).__name__)
             return False
         if not stored_device_id or stored_device_id == device_id:
             return False
@@ -1554,7 +1727,7 @@ class MatrixAdapter(BasePlatformAdapter):
                     "Matrix: pickle key migration failed while re-pickling "
                     "sessions (%s) — leaving the account under the legacy "
                     "key so the migration is retried on the next start.",
-                    exc,
+                    type(exc).__name__,
                 )
                 return False
             await crypto_store.put_account(account)
@@ -1613,10 +1786,10 @@ class MatrixAdapter(BasePlatformAdapter):
                     logger.warning(
                         "Matrix: %s row %s cannot be unpickled with the "
                         "current or legacy key; leaving it in place, its "
-                        "sessions are unrecoverable: %s",
+                        "sessions are unrecoverable (%s)",
                         table,
                         row["session_id"],
-                        exc,
+                        type(exc).__name__,
                     )
                     continue
                 await crypto_db.execute(
@@ -1640,12 +1813,14 @@ class MatrixAdapter(BasePlatformAdapter):
             )
             return True
         try:
-            resp = await client.query_keys({client.mxid: [client.device_id]})
+            resp = await asyncio.wait_for(
+                client.query_keys({client.mxid: [client.device_id]}),
+                timeout=getattr(self, "_matrix_request_timeout_seconds", 45.0),
+            )
         except Exception as exc:
             logger.error(
-                "Matrix: cannot verify device keys on server: %s — refusing E2EE",
-                exc,
-                exc_info=True,
+                "Matrix: cannot verify device keys on server (%s) — refusing E2EE",
+                type(exc).__name__,
             )
             return False
 
@@ -1658,9 +1833,15 @@ class MatrixAdapter(BasePlatformAdapter):
             logger.warning("Matrix: device keys missing from server — re-uploading")
             olm.account.shared = False
             try:
-                await olm.share_keys()
+                await asyncio.wait_for(
+                    olm.share_keys(),
+                    timeout=getattr(self, "_matrix_request_timeout_seconds", 45.0),
+                )
             except Exception as exc:
-                logger.error("Matrix: failed to re-upload device keys: %s", exc, exc_info=True)
+                logger.error(
+                    "Matrix: failed to re-upload device keys (%s)",
+                    type(exc).__name__,
+                )
                 return False
             return await self._reverify_keys_after_upload(client, local_ed25519)
 
@@ -1693,14 +1874,16 @@ class MatrixAdapter(BasePlatformAdapter):
             except Exception:
                 pass
             try:
-                await olm.share_keys()
+                await asyncio.wait_for(
+                    olm.share_keys(),
+                    timeout=getattr(self, "_matrix_request_timeout_seconds", 45.0),
+                )
             except Exception as exc:
                 logger.error(
-                    "Matrix: cannot upload device keys for %s: %s. "
+                    "Matrix: cannot upload device keys for %s (%s). "
                     "Try generating a new access token to get a fresh device.",
                     client.device_id,
-                    exc,
-                    exc_info=True,
+                    type(exc).__name__,
                 )
                 return False
             return await self._reverify_keys_after_upload(client, local_ed25519)
@@ -1712,13 +1895,30 @@ class MatrixAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        async with self._matrix_lifecycle_lock:
+            try:
+                result = await self._connect_impl(is_reconnect=is_reconnect)
+                if not result:
+                    await self._disconnect_impl()
+                return result
+            except BaseException:
+                await self._disconnect_impl()
+                raise
+
+    async def _connect_impl(self, *, is_reconnect: bool = False) -> bool:
         """Connect to the Matrix homeserver and start syncing."""
+        self._matrix_lifecycle_generation = (
+            int(getattr(self, "_matrix_lifecycle_generation", 0)) + 1
+        )
         self._device_id_unverified = False
         if self._client is not None:
             try:
-                await self.disconnect()
+                await self._disconnect_impl()
             except Exception as exc:
-                logger.warning("Matrix: error disconnecting before reconnect: %s", exc)
+                logger.warning(
+                    "Matrix: error disconnecting before reconnect (%s)",
+                    type(exc).__name__,
+                )
 
         from mautrix.api import HTTPAPI
         from mautrix.client import Client
@@ -1751,6 +1951,8 @@ class MatrixAdapter(BasePlatformAdapter):
         )
 
         self._client = client
+        self._matrix_client_lifecycle_active = True
+        self._matrix_client_runtime_bound = True
 
         # Authenticate.
         if self._access_token:
@@ -1758,7 +1960,10 @@ class MatrixAdapter(BasePlatformAdapter):
 
             # Validate the token and learn user_id / device_id.
             try:
-                resp = await client.whoami()
+                resp = await asyncio.wait_for(
+                    client.whoami(),
+                    timeout=getattr(self, "_matrix_request_timeout_seconds", 45.0),
+                )
                 resolved_user_id = getattr(resp, "user_id", "") or self._user_id
                 resolved_device_id = str(getattr(resp, "device_id", "") or "")
                 if resolved_user_id:
@@ -1797,7 +2002,14 @@ class MatrixAdapter(BasePlatformAdapter):
 
                 if not client.device_id:
                     try:
-                        dev_resp = await client.query_keys({client.mxid: []})
+                        dev_resp = await asyncio.wait_for(
+                            client.query_keys({client.mxid: []}),
+                            timeout=getattr(
+                                self,
+                                "_matrix_request_timeout_seconds",
+                                45.0,
+                            ),
+                        )
                         all_devices = (
                             (getattr(dev_resp, "device_keys", {}) or {})
                             .get(str(client.mxid)) or {}
@@ -1812,7 +2024,8 @@ class MatrixAdapter(BasePlatformAdapter):
                             )
                     except Exception as exc:
                         logger.warning(
-                            "Matrix: device list query failed: %s", exc
+                            "Matrix: device list query failed (%s)",
+                            type(exc).__name__,
                         )
 
                 if not client.device_id:
@@ -1832,25 +2045,27 @@ class MatrixAdapter(BasePlatformAdapter):
                 )
             except Exception as exc:
                 logger.error(
-                    "Matrix: whoami failed — check MATRIX_ACCESS_TOKEN and MATRIX_HOMESERVER: %s",
-                    exc,
-                    exc_info=True,
+                    "Matrix: whoami failed — check MATRIX_ACCESS_TOKEN and MATRIX_HOMESERVER (%s)",
+                    type(exc).__name__,
                 )
                 await api.session.close()
                 return False
         elif self._password and self._user_id:
             try:
-                resp = await client.login(
-                    identifier=self._user_id,
-                    password=self._password,
-                    device_name="Hermes Agent",
-                    device_id=self._device_id or None,
+                resp = await asyncio.wait_for(
+                    client.login(
+                        identifier=self._user_id,
+                        password=self._password,
+                        device_name="Hermes Agent",
+                        device_id=self._device_id or None,
+                    ),
+                    timeout=getattr(self, "_matrix_request_timeout_seconds", 45.0),
                 )
                 if resp and hasattr(resp, "device_id"):
                     client.device_id = resp.device_id
                 logger.info("Matrix: logged in as %s", self._user_id)
             except Exception as exc:
-                logger.error("Matrix: login failed — %s", exc)
+                logger.error("Matrix: login failed (%s)", type(exc).__name__)
                 await api.session.close()
                 return False
         else:
@@ -1891,15 +2106,15 @@ class MatrixAdapter(BasePlatformAdapter):
                     if self._e2ee_mode == "optional":
                         logger.warning(
                             "Matrix: failed to import optional E2EE client; "
-                            "continuing without encrypted-room support: %s. %s",
-                            exc,
+                            "continuing without encrypted-room support: (%s). %s",
+                            type(exc).__name__,
                             _E2EE_INSTALL_HINT,
                         )
                         self._encryption = False
                     else:
                         logger.error(
-                            "Matrix: failed to import E2EE client: %s. %s",
-                            exc,
+                            "Matrix: failed to import E2EE client (%s). %s",
+                            type(exc).__name__,
                             _E2EE_INSTALL_HINT,
                         )
                         await api.session.close()
@@ -1956,7 +2171,15 @@ class MatrixAdapter(BasePlatformAdapter):
                             )
 
                     crypto_state = _CryptoStateStore(state_store, self._joined_rooms, client)
-                    olm = OlmMachine(client, crypto_store, crypto_state)
+                    if isinstance(OlmMachine, type):
+                        olm_cls = _build_hermes_olm_machine(OlmMachine)
+                        self._e2ee_recipient_enforcement_active = True
+                    else:
+                        # Keep lightweight dependency-injection test doubles
+                        # usable without trying to subclass MagicMock.
+                        olm_cls = OlmMachine
+                        self._e2ee_recipient_enforcement_active = False
+                    olm = olm_cls(client, crypto_store, crypto_state)
                     olm.share_keys_min_trust = TrustState.UNVERIFIED
                     olm.send_keys_min_trust = TrustState.UNVERIFIED
 
@@ -1968,7 +2191,14 @@ class MatrixAdapter(BasePlatformAdapter):
                         return False
 
                     try:
-                        await olm.share_keys()
+                        await asyncio.wait_for(
+                            olm.share_keys(),
+                            timeout=getattr(
+                                self,
+                                "_matrix_request_timeout_seconds",
+                                45.0,
+                            ),
+                        )
                     except Exception as exc:
                         exc_str = str(exc)
                         if "already exists" in exc_str:
@@ -1982,7 +2212,10 @@ class MatrixAdapter(BasePlatformAdapter):
                             await crypto_db.stop()
                             await api.session.close()
                             return False
-                        logger.warning("Matrix: share_keys() warning during startup: %s", exc)
+                        logger.warning(
+                            "Matrix: share_keys() warning during startup (%s)",
+                            type(exc).__name__,
+                        )
 
                     # Honor the active profile's secret scope so a secondary
                     # profile under gateway.multiplex_profiles resolves its own
@@ -1994,13 +2227,19 @@ class MatrixAdapter(BasePlatformAdapter):
                             await olm.verify_with_recovery_key(recovery_key)
                             logger.info("Matrix: cross-signing verified via recovery key")
                         except Exception as exc:
-                            logger.warning("Matrix: recovery key verification failed: %s", exc)
+                            logger.warning(
+                                "Matrix: recovery key verification failed (%s)",
+                                type(exc).__name__,
+                            )
                     else:
                         try:
                             own_xsign = await olm.get_own_cross_signing_public_keys()
                         except Exception as exc:
                             own_xsign = None
-                            logger.warning("Matrix: cross-signing key lookup failed: %s", exc)
+                            logger.warning(
+                                "Matrix: cross-signing key lookup failed (%s)",
+                                type(exc).__name__,
+                            )
                         if own_xsign is None:
                             _, output_error = _get_matrix_recovery_key_output_target()
                             if output_error == "not_configured":
@@ -2037,10 +2276,11 @@ class MatrixAdapter(BasePlatformAdapter):
                                     logger.warning(
                                         "Matrix: cross-signing bootstrap failed "
                                         "(non-fatal — Element will show 'not verified by its owner'): %s",
-                                        exc,
+                                        type(exc).__name__,
                                     )
 
                     client.crypto = olm
+                    self._e2ee_machine_active = True
                     logger.info(
                         "Matrix: E2EE enabled (store: %s%s)",
                         str(_CRYPTO_DB_PATH),
@@ -2050,15 +2290,15 @@ class MatrixAdapter(BasePlatformAdapter):
                     if self._e2ee_mode == "optional":
                         logger.warning(
                             "Matrix: failed to create optional E2EE client; "
-                            "continuing without encrypted-room support: %s. %s",
-                            exc,
+                            "continuing without encrypted-room support: (%s). %s",
+                            type(exc).__name__,
                             _E2EE_INSTALL_HINT,
                         )
                         self._encryption = False
                     else:
                         logger.error(
-                            "Matrix: failed to create E2EE client: %s. %s",
-                            exc,
+                            "Matrix: failed to create E2EE client (%s). %s",
+                            type(exc).__name__,
                             _E2EE_INSTALL_HINT,
                         )
                         await api.session.close()
@@ -2095,9 +2335,13 @@ class MatrixAdapter(BasePlatformAdapter):
         self._late_grace_skew = 0.0
         self._clock_skew_warned = False
         self._closing = False
+        initial_sync_succeeded = False
 
         try:
-            sync_data = await client.sync(timeout=10000, full_state=True)
+            sync_data = await asyncio.wait_for(
+                client.sync(timeout=10000, full_state=True),
+                timeout=getattr(self, "_matrix_request_timeout_seconds", 45.0),
+            )
             if isinstance(sync_data, dict):
                 self._last_sync_ts = time.time()
                 rooms_join = sync_data.get("rooms", {}).get("join", {})
@@ -2115,29 +2359,59 @@ class MatrixAdapter(BasePlatformAdapter):
                     len(self._joined_rooms),
                 )
                 # Build DM room cache from m.direct account data.
-                await self._refresh_dm_cache()
+                await asyncio.wait_for(
+                    self._refresh_dm_cache(),
+                    timeout=getattr(self, "_matrix_request_timeout_seconds", 45.0),
+                )
 
                 # Dispatch events from the initial sync so the OlmMachine
                 # receives to-device key shares queued while we were offline.
                 try:
                     await self._dispatch_sync(sync_data)
                 except Exception as exc:
-                    logger.warning("Matrix: initial sync event dispatch error: %s", exc)
+                    logger.warning(
+                        "Matrix: initial sync event dispatch error (%s)",
+                        type(exc).__name__,
+                    )
                 self._schedule_pending_invite_joins(sync_data)
+                initial_sync_succeeded = True
             else:
                 logger.warning(
                     "Matrix: initial sync returned unexpected type %s",
                     type(sync_data).__name__,
                 )
         except Exception as exc:
-            logger.warning("Matrix: initial sync error: %s", exc)
+            logger.warning("Matrix: initial sync error (%s)", type(exc).__name__)
+
+        if not initial_sync_succeeded:
+            logger.error("Matrix: refusing readiness after failed initial sync")
+            await self._disconnect_impl()
+            return False
+
+        # Authentication and initial sync are complete. Mark the client ready
+        # before reconciliation so the post-reconnect room pass is real, not
+        # a no-op through the lifecycle fence.
+        self._matrix_client_connected = True
 
         # Share keys after initial sync if E2EE is enabled.
         if self._encryption and getattr(client, "crypto", None):
             try:
-                await client.crypto.share_keys()
+                await asyncio.wait_for(
+                    client.crypto.share_keys(),
+                    timeout=getattr(self, "_matrix_request_timeout_seconds", 45.0),
+                )
             except Exception as exc:
-                logger.warning("Matrix: initial key share failed: %s", exc)
+                logger.warning(
+                    "Matrix: initial key share failed (%s)",
+                    type(exc).__name__,
+                )
+            if (
+                self._e2ee_recipient_enforcement_active
+                and not await self._reconcile_encrypted_rooms()
+            ):
+                logger.error("Matrix: refusing readiness after encrypted-room reconciliation failure")
+                await self._disconnect_impl()
+                return False
 
         # Start the sync loop.
         self._sync_task = asyncio.create_task(self._sync_loop())
@@ -2145,47 +2419,538 @@ class MatrixAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
-        """Disconnect from Matrix."""
-        self._closing = True
+        async with self._matrix_lifecycle_lock:
+            await self._disconnect_impl()
 
-        if self._sync_task and not self._sync_task.done():
+    async def _disconnect_impl(self) -> None:
+        """Disconnect from Matrix."""
+        self._matrix_lifecycle_generation = (
+            int(getattr(self, "_matrix_lifecycle_generation", 0)) + 1
+        )
+        self._closing = True
+        self._matrix_client_connected = False
+        shutdown_timeout = getattr(self, "_matrix_request_timeout_seconds", 45.0)
+
+        current_task = asyncio.current_task()
+        readiness_tasks = [
+            task
+            for task in self._e2ee_readiness_tasks
+            if task is not current_task
+        ]
+        for task in readiness_tasks:
+            if not task.done():
+                task.cancel()
+        if readiness_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*readiness_tasks, return_exceptions=True),
+                    timeout=shutdown_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Matrix: readiness tasks did not stop during disconnect")
+        self._e2ee_readiness_tasks.clear()
+        self._device_refresh_ts.clear()
+        self._e2ee_room_targets.clear()
+
+        if (
+            self._sync_task
+            and self._sync_task is not current_task
+            and not self._sync_task.done()
+        ):
             self._sync_task.cancel()
             try:
-                await self._sync_task
+                await asyncio.wait_for(self._sync_task, timeout=shutdown_timeout)
+            except asyncio.TimeoutError:
+                logger.warning("Matrix: sync task did not stop during disconnect")
             except (asyncio.CancelledError, Exception):
                 pass
 
-        invite_join_tasks = list(self._invite_join_tasks.values())
+        current_task = asyncio.current_task()
+        invite_join_tasks = [
+            task
+            for task in self._invite_join_tasks.values()
+            if task is not current_task
+        ]
         for task in invite_join_tasks:
             if not task.done():
                 task.cancel()
         if invite_join_tasks:
-            await asyncio.gather(*invite_join_tasks, return_exceptions=True)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*invite_join_tasks, return_exceptions=True),
+                    timeout=shutdown_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Matrix: invite tasks did not stop during disconnect")
         self._invite_join_tasks.clear()
 
-        redaction_tasks = list(self._reaction_redaction_tasks)
+        redaction_tasks = [
+            task
+            for task in self._reaction_redaction_tasks
+            if task is not current_task
+        ]
         for task in redaction_tasks:
             if not task.done():
                 task.cancel()
         if redaction_tasks:
-            await asyncio.gather(*redaction_tasks, return_exceptions=True)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*redaction_tasks, return_exceptions=True),
+                    timeout=shutdown_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Matrix: redaction tasks did not stop during disconnect")
         self._reaction_redaction_tasks.clear()
 
         # Close the SQLite crypto store database.
         if hasattr(self, "_crypto_db") and self._crypto_db:
             try:
-                await self._crypto_db.stop()
+                await asyncio.wait_for(
+                    self._crypto_db.stop(),
+                    timeout=shutdown_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Matrix: crypto DB did not stop during disconnect")
             except Exception as exc:
-                logger.debug("Matrix: could not close crypto DB on disconnect: %s", exc)
+                logger.debug(
+                    "Matrix: could not close crypto DB on disconnect (%s)",
+                    type(exc).__name__,
+                )
 
         if self._client:
             try:
-                await self._client.api.session.close()
+                await asyncio.wait_for(
+                    self._client.api.session.close(),
+                    timeout=shutdown_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Matrix: HTTP session did not close during disconnect")
             except Exception:
                 pass
             self._client = None
+        self._e2ee_machine_active = False
+        self._e2ee_recipient_enforcement_active = False
+        self._matrix_client_lifecycle_active = False
+        self._matrix_client_runtime_bound = False
 
         logger.info("Matrix: disconnected")
+
+    async def _room_is_encrypted(self, room_id: str) -> bool:
+        """Return authoritative room encryption state for the active crypto machine."""
+        client = self._client
+        if not getattr(self, "_matrix_client_runtime_bound", False):
+            if self._encryption:
+                raise RuntimeError("Matrix client runtime is not bound")
+            return False
+        if not getattr(self, "_matrix_client_lifecycle_active", False):
+            raise RuntimeError("Matrix client lifecycle is inactive")
+        if not getattr(self, "_matrix_client_connected", False):
+            raise RuntimeError("Matrix client is still initializing")
+        crypto = getattr(client, "crypto", None) if client else None
+        if crypto is None:
+            # Optional mode may have a connected client without an Olm
+            # machine. Still inspect the room state before permitting a
+            # plaintext fallback; only MNotFound is a confirmed plain room.
+            state_store = _CryptoStateStore(
+                getattr(client, "state_store", None),
+                getattr(self, "_joined_rooms", set()),
+                client,
+            )
+            return bool(
+                await state_store.get_encryption_info(
+                    RoomID(room_id), authoritative=True
+                )
+            )
+        state_store = getattr(crypto, "state_store", None)
+        if state_store is None:
+            raise RuntimeError("Matrix E2EE state store is unavailable")
+        try:
+            if not type(client).__module__.startswith("mautrix"):
+                return bool(await state_store.is_encrypted(RoomID(room_id)))
+            authoritative_store = state_store
+            if not isinstance(authoritative_store, _CryptoStateStore):
+                authoritative_store = _CryptoStateStore(
+                    getattr(client, "state_store", state_store),
+                    getattr(self, "_joined_rooms", set()),
+                    client,
+                )
+            return bool(
+                await authoritative_store.get_encryption_info(
+                    RoomID(room_id), authoritative=True
+                )
+            )
+        except _MatrixStateInspectionError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                f"Matrix: unable to inspect encrypted room {room_id} before send"
+            ) from exc
+
+    async def _encrypted_room_users(
+        self, room_id: str, *, room_encrypted: Optional[bool] = None
+    ) -> list[Any]:
+        """Return current joined peer users for an encrypted room.
+
+        An empty list means an unencrypted room or an encrypted room with no
+        joined peer users. Inspection failures raise instead of being treated
+        as plaintext-safe.
+        """
+        if room_encrypted is None:
+            room_encrypted = await self._room_is_encrypted(room_id)
+        if not room_encrypted:
+            return []
+        client = self._client
+        try:
+            members = await client.get_joined_members(RoomID(room_id))
+        except Exception as exc:
+            raise RuntimeError(
+                f"Matrix: unable to inspect encrypted room {room_id} before send"
+            ) from exc
+
+        own_user = str(self._user_id or getattr(client, "mxid", ""))
+        return [
+            UserID(str(user_id))
+            for user_id in members
+            if str(user_id) and str(user_id) != own_user
+        ]
+
+    async def _refresh_encrypted_room_devices(
+        self, room_id: str, users: list[Any]
+    ) -> None:
+        """Fetch current device keys for every peer in an encrypted room."""
+        if not users:
+            return
+        crypto = getattr(self._client, "crypto", None)
+        fetch_keys = getattr(crypto, "_fetch_keys", None) if crypto else None
+        if fetch_keys is None:
+            raise RuntimeError("Matrix E2EE device refresh is unavailable")
+
+        now = time.monotonic()
+        if (
+            self._device_refresh_interval > 0
+            and now - self._device_refresh_ts.get(room_id, 0.0)
+            < self._device_refresh_interval
+        ):
+            return
+
+        query_keys = getattr(self._client, "query_keys", None)
+        fresh_device_ids = None
+        if callable(query_keys):
+            response = await query_keys({UserID(str(user_id)) for user_id in users})
+            failures = getattr(response, "failures", {}) or {}
+            if failures:
+                self._device_refresh_ts.pop(room_id, None)
+                self._e2ee_room_targets.pop(room_id, None)
+                raise RuntimeError(
+                    f"Matrix device refresh reported {len(failures)} key-query failure(s)"
+                )
+            fresh_maps = getattr(response, "device_keys", {}) or {}
+            fresh_by_user = {str(user_id): devices for user_id, devices in fresh_maps.items()}
+            expected_users = {str(user_id) for user_id in users}
+            if not expected_users.issubset(fresh_by_user):
+                self._device_refresh_ts.pop(room_id, None)
+                self._e2ee_room_targets.pop(room_id, None)
+                raise RuntimeError("Matrix device refresh returned an incomplete key map")
+            fresh_device_ids = {
+                user_id: {str(device_id) for device_id in devices}
+                for user_id, devices in fresh_by_user.items()
+            }
+            for user_id, devices in fresh_by_user.items():
+                if not devices:
+                    self._device_refresh_ts.pop(room_id, None)
+                    self._e2ee_room_targets.pop(room_id, None)
+                    raise RuntimeError(f"Matrix device refresh returned no devices for {user_id}")
+                for device_id, device_keys in devices.items():
+                    keys = getattr(device_keys, "keys", {}) or {}
+                    if not keys.get(f"curve25519:{device_id}") or not keys.get(
+                        f"ed25519:{device_id}"
+                    ):
+                        self._device_refresh_ts.pop(room_id, None)
+                        self._e2ee_room_targets.pop(room_id, None)
+                        raise RuntimeError(
+                            f"Matrix device refresh returned invalid keys for {user_id}/{device_id}"
+                        )
+
+        lock = getattr(crypto, "_fetch_keys_lock", None)
+        if lock is not None:
+            async with lock:
+                fetched = await fetch_keys(users, include_untracked=True)
+        else:
+            fetched = await fetch_keys(users, include_untracked=True)
+        expected_users = {str(user_id) for user_id in users}
+        fetched_users = {str(user_id) for user_id in (fetched or {})}
+        if not expected_users.issubset(fetched_users):
+            self._device_refresh_ts.pop(room_id, None)
+            self._e2ee_room_targets.pop(room_id, None)
+            missing_users = sorted(expected_users - fetched_users)
+            raise RuntimeError(
+                f"Matrix device refresh was incomplete for {len(missing_users)} peer user(s)"
+            )
+        if fresh_device_ids is not None:
+            fetched_device_ids = {
+                str(user_id): {str(device_id) for device_id in devices}
+                for user_id, devices in (fetched or {}).items()
+            }
+            for user_id in expected_users:
+                if fetched_device_ids.get(user_id) != fresh_device_ids.get(user_id):
+                    self._device_refresh_ts.pop(room_id, None)
+                    self._e2ee_room_targets.pop(room_id, None)
+                    raise RuntimeError(
+                        f"Matrix device refresh changed during key reconciliation for {user_id}"
+                    )
+        for user_id in users:
+            fetched_devices = (fetched or {}).get(user_id)
+            if not fetched_devices:
+                self._device_refresh_ts.pop(room_id, None)
+                self._e2ee_room_targets.pop(room_id, None)
+                raise RuntimeError(f"Matrix device refresh returned no devices for {user_id}")
+            if any(
+                not getattr(device, "identity_key", "")
+                for device in fetched_devices.values()
+            ):
+                self._device_refresh_ts.pop(room_id, None)
+                self._e2ee_room_targets.pop(room_id, None)
+                raise RuntimeError(
+                    f"Matrix device refresh returned an invalid device for {user_id}"
+                )
+        self._device_refresh_ts[room_id] = now
+        logger.debug(
+            "Matrix: refreshed device lists for %d peer user(s) in %s",
+            len(users),
+            room_id,
+        )
+
+    async def _current_e2ee_targets(
+        self, users: list[Any]
+    ) -> Set[tuple[str, str, str]]:
+        """Return current non-blacklisted peer device targets."""
+        crypto = getattr(self._client, "crypto", None)
+        store = getattr(crypto, "crypto_store", None) if crypto else None
+        if store is None:
+            raise RuntimeError("Matrix E2EE crypto store is unavailable")
+        targets: Set[tuple[str, str, str]] = set()
+        for user_id in users:
+            devices = await store.get_devices(UserID(str(user_id)))
+            if devices is None:
+                raise RuntimeError(f"No device list available for {user_id}")
+            blacklisted = getattr(TrustState, "BLACKLISTED", None)
+            for device_id, device in devices.items():
+                if getattr(device, "deleted", False):
+                    continue
+                if blacklisted is not None and getattr(device, "trust", None) == blacklisted:
+                    continue
+                identity_key = str(getattr(device, "identity_key", ""))
+                if not identity_key:
+                    raise RuntimeError(f"Device {user_id}/{device_id} has no identity key")
+                targets.add(
+                    (
+                        str(user_id),
+                        str(device_id),
+                        identity_key,
+                    )
+                )
+        return targets
+
+    async def _ensure_encrypted_room_ready(self, room_id: str) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            self._e2ee_readiness_tasks.add(task)
+        try:
+            await self._ensure_encrypted_room_ready_impl(room_id)
+        except asyncio.CancelledError:
+            self._device_refresh_ts.pop(room_id, None)
+            self._e2ee_room_targets.pop(room_id, None)
+            raise
+        except Exception:
+            self._device_refresh_ts.pop(room_id, None)
+            self._e2ee_room_targets.pop(room_id, None)
+            raise
+        finally:
+            if task is not None:
+                self._e2ee_readiness_tasks.discard(task)
+
+    async def _ensure_encrypted_room_ready_impl(self, room_id: str) -> None:
+        """Ensure a persisted Megolm session is shared to current devices.
+
+        Mautrix persists the outbound session's ``shared`` bit but not its
+        in-memory recipient set. On reconnect, explicitly mark the persisted
+        session unshared and re-run its normal share path so all current peer
+        devices receive the key. The custom OlmMachine rejects zero-recipient
+        shares before ciphertext can be sent.
+        """
+        room_encrypted = await self._room_is_encrypted(room_id)
+        if not room_encrypted:
+            return
+        users = await self._encrypted_room_users(
+            room_id, room_encrypted=True
+        )
+        if not users:
+            self._device_refresh_ts.pop(room_id, None)
+            raise RuntimeError(
+                f"Matrix encrypted room {room_id} has no joined peer users"
+            )
+
+        async with self._e2ee_share_lock:
+            await self._refresh_encrypted_room_devices(room_id, users)
+            targets = await self._current_e2ee_targets(users)
+            if not targets:
+                self._device_refresh_ts.pop(room_id, None)
+                raise RuntimeError(
+                    f"Matrix encrypted room {room_id} has no eligible peer devices"
+                )
+
+            crypto = self._client.crypto
+            store = crypto.crypto_store
+            room_key = str(room_id)
+            session = await store.get_outbound_group_session(RoomID(room_id))
+            cached_targets = self._e2ee_room_targets.get(room_key)
+            if (
+                session is not None
+                and session.shared
+                and not session.expired
+                and cached_targets == (str(session.id), targets)
+            ):
+                return
+
+            if session is not None and not session.expired:
+                # from_pickle() resets users_shared_with, so force the normal
+                # Mautrix share path to reuse this active session and send its
+                # room key to current devices after reconnect.
+                session.shared = False
+                session.users_shared_with.clear()
+                session.users_ignored.clear()
+                await store.add_outbound_group_session(session)
+
+            self._e2ee_room_targets.pop(room_key, None)
+            try:
+                await crypto.share_group_session(RoomID(room_id), users)
+            except asyncio.CancelledError:
+                self._e2ee_room_targets.pop(room_key, None)
+                self._device_refresh_ts.pop(room_key, None)
+                raise
+            except Exception:
+                self._e2ee_room_targets.pop(room_key, None)
+                self._device_refresh_ts.pop(room_key, None)
+                raise
+            share_record = getattr(crypto, "_hermes_last_share_targets", {}).get(room_key)
+            actual_session_id = share_record[0] if share_record else ""
+            actual_targets = share_record[1] if share_record else set()
+            if not targets.issubset(actual_targets):
+                await store.remove_outbound_group_sessions([RoomID(room_id)])
+                self._e2ee_room_targets.pop(room_key, None)
+                self._device_refresh_ts.pop(room_key, None)
+                missing = sorted(targets - actual_targets)
+                raise RuntimeError(
+                    f"Matrix Megolm key share for {room_id} missed {len(missing)} device(s)"
+                )
+            persisted_session = await store.get_outbound_group_session(RoomID(room_id))
+            if (
+                persisted_session is None
+                or not persisted_session.shared
+                or actual_session_id != str(persisted_session.id)
+            ):
+                self._e2ee_room_targets.pop(room_key, None)
+                self._device_refresh_ts.pop(room_key, None)
+                raise RuntimeError(
+                    f"Matrix Megolm key share for {room_id} was not persisted as shared"
+                )
+            self._e2ee_room_targets[room_key] = (
+                str(persisted_session.id),
+                set(targets),
+            )
+
+    async def _reconcile_encrypted_rooms(self) -> bool:
+        """Re-share active Megolm sessions after initial sync/reconnect."""
+        success = True
+        async with self._e2ee_share_lock:
+            self._device_refresh_ts.clear()
+            self._e2ee_room_targets.clear()
+        for room_id in sorted(self._joined_rooms):
+            try:
+                await asyncio.wait_for(
+                    self._ensure_encrypted_room_ready(room_id),
+                    timeout=getattr(self, "_matrix_request_timeout_seconds", 45.0),
+                )
+            except Exception as exc:
+                success = False
+                logger.error(
+                    "Matrix: encrypted-room key reconciliation failed for %s (%s)",
+                    room_id,
+                    type(exc).__name__,
+                )
+        return success
+
+    def _capture_lifecycle_token(self) -> tuple[int, bool]:
+        return (
+            int(getattr(self, "_matrix_lifecycle_generation", 0)),
+            bool(getattr(self, "_matrix_client_runtime_bound", False)),
+        )
+
+    def _assert_lifecycle_token(self, token: tuple[int, bool]) -> None:
+        generation, was_runtime_bound = token
+        current_generation = int(getattr(self, "_matrix_lifecycle_generation", 0))
+        runtime_bound = bool(getattr(self, "_matrix_client_runtime_bound", False))
+        if generation != current_generation and (was_runtime_bound or runtime_bound):
+            raise RuntimeError("Matrix client lifecycle changed during operation")
+        if was_runtime_bound and not runtime_bound:
+            raise RuntimeError("Matrix client lifecycle ended during operation")
+
+    async def _send_room_event_locked(
+        self,
+        room_id: str,
+        event_type: Any,
+        content: Any,
+        *,
+        lifecycle_token: Optional[tuple[int, bool]] = None,
+    ) -> Any:
+        """Verify E2EE key delivery and send while lifecycle lock is held."""
+        token = lifecycle_token or self._capture_lifecycle_token()
+        self._assert_lifecycle_token(token)
+        if self._encryption and not getattr(
+            self, "_matrix_client_runtime_bound", False
+        ):
+            raise RuntimeError("Matrix client runtime is not bound")
+        await asyncio.wait_for(
+            self._ensure_encrypted_room_ready(str(room_id)),
+            timeout=getattr(self, "_matrix_request_timeout_seconds", 45.0),
+        )
+        self._assert_lifecycle_token(token)
+        if (
+            getattr(self, "_matrix_client_runtime_bound", False)
+            and (
+                not self._matrix_client_lifecycle_active
+                or not self._matrix_client_connected
+                or self._client is None
+            )
+        ):
+            raise RuntimeError("Matrix client is not ready for room send")
+        return await asyncio.wait_for(
+            self._client.send_message_event(
+                RoomID(room_id),
+                event_type,
+                content,
+            ),
+            timeout=getattr(self, "_matrix_request_timeout_seconds", 45.0),
+        )
+
+    async def _send_room_event(
+        self,
+        room_id: str,
+        event_type: Any,
+        content: Any,
+        *,
+        lifecycle_token: Optional[tuple[int, bool]] = None,
+    ) -> Any:
+        """Verify E2EE key delivery, then send a room event."""
+        token = lifecycle_token or self._capture_lifecycle_token()
+        async with self._matrix_lifecycle_lock:
+            self._assert_lifecycle_token(token)
+            return await self._send_room_event_locked(
+                room_id,
+                event_type,
+                content,
+                lifecycle_token=token,
+            )
 
     async def send(
         self,
@@ -2198,6 +2963,7 @@ class MatrixAdapter(BasePlatformAdapter):
 
         if not content:
             return SendResult(success=True)
+        lifecycle_token = self._capture_lifecycle_token()
 
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.max_message_length)
@@ -2210,12 +2976,13 @@ class MatrixAdapter(BasePlatformAdapter):
 
             try:
                 event_id = await asyncio.wait_for(
-                    self._client.send_message_event(
-                        RoomID(chat_id),
+                    self._send_room_event(
+                        chat_id,
                         EventType.ROOM_MESSAGE,
                         msg_content,
+                        lifecycle_token=lifecycle_token,
                     ),
-                    timeout=45,
+                    timeout=getattr(self, "_matrix_request_timeout_seconds", 45.0),
                 )
                 last_event_id = str(event_id)
                 logger.info("Matrix: sent event %s to %s", last_event_id, chat_id)
@@ -2223,15 +2990,31 @@ class MatrixAdapter(BasePlatformAdapter):
                 # On E2EE errors, retry after sharing keys.
                 if self._encryption and getattr(self._client, "crypto", None):
                     try:
-                        await self._client.crypto.share_keys()
-                        event_id = await asyncio.wait_for(
-                            self._client.send_message_event(
-                                RoomID(chat_id),
-                                EventType.ROOM_MESSAGE,
-                                msg_content,
-                            ),
-                            timeout=45,
-                        )
+                        async with self._matrix_lifecycle_lock:
+                            client = self._client
+                            await asyncio.wait_for(
+                                client.crypto.share_keys(),
+                                timeout=getattr(
+                                    self,
+                                    "_matrix_request_timeout_seconds",
+                                    45.0,
+                                ),
+                            )
+                            if getattr(self, "_matrix_client_runtime_bound", False) and (
+                                client is not self._client
+                                or not self._matrix_client_lifecycle_active
+                                or not self._matrix_client_connected
+                            ):
+                                raise RuntimeError("Matrix client changed during send retry")
+                            event_id = await asyncio.wait_for(
+                                self._send_room_event_locked(
+                                    chat_id,
+                                    EventType.ROOM_MESSAGE,
+                                    msg_content,
+                                    lifecycle_token=lifecycle_token,
+                                ),
+                                timeout=getattr(self, "_matrix_request_timeout_seconds", 45.0),
+                            )
                         last_event_id = str(event_id)
                         logger.info(
                             "Matrix: sent event %s to %s (after key share)",
@@ -2241,13 +3024,23 @@ class MatrixAdapter(BasePlatformAdapter):
                         continue
                     except Exception as retry_exc:
                         logger.error(
-                            "Matrix: failed to send to %s after retry: %s",
+                            "Matrix: failed to send to %s after retry (%s)",
                             chat_id,
-                            retry_exc,
+                            type(retry_exc).__name__,
                         )
-                        return SendResult(success=False, error=str(retry_exc))
-                logger.error("Matrix: failed to send to %s: %s", chat_id, exc)
-                return SendResult(success=False, error=str(exc))
+                        return SendResult(
+                            success=False,
+                            error=_matrix_exception_summary(retry_exc),
+                        )
+                logger.error(
+                    "Matrix: failed to send to %s (%s)",
+                    chat_id,
+                    type(exc).__name__,
+                )
+                return SendResult(
+                    success=False,
+                    error=_matrix_exception_summary(exc),
+                )
 
         return SendResult(success=True, message_id=last_event_id)
 
@@ -2352,14 +3145,17 @@ class MatrixAdapter(BasePlatformAdapter):
         }
 
         try:
-            event_id = await self._client.send_message_event(
-                RoomID(chat_id),
+            event_id = await self._send_room_event(
+                chat_id,
                 EventType.ROOM_MESSAGE,
                 msg_content,
             )
             return SendResult(success=True, message_id=str(event_id))
         except Exception as exc:
-            return SendResult(success=False, error=str(exc))
+            return SendResult(
+                success=False,
+                error=_matrix_exception_summary(exc),
+            )
 
     async def send_image(
         self,
@@ -2382,9 +3178,9 @@ class MatrixAdapter(BasePlatformAdapter):
             data, ct, fname = await self._download_external_media_with_cap(image_url)
         except Exception as exc:
             logger.warning(
-                "Matrix: failed to download image %s: %s",
+                "Matrix: failed to download image %s (%s)",
                 _redact_url_for_log(image_url),
-                exc,
+                type(exc).__name__,
             )
             fallback = (
                 "I couldn't download and upload the image to Matrix. "
@@ -2712,7 +3508,11 @@ class MatrixAdapter(BasePlatformAdapter):
                 if reaction_result:
                     prompt.bot_reaction_events[emoji] = str(reaction_result)
             except Exception as exc:
-                logger.debug("Matrix: failed to add approval reaction %s: %s", emoji, exc)
+                logger.debug(
+                    "Matrix: failed to add approval reaction %s (%s)",
+                    emoji,
+                    type(exc).__name__,
+                )
 
         return result
 
@@ -2793,7 +3593,11 @@ class MatrixAdapter(BasePlatformAdapter):
                 if reaction_event_id:
                     prompt.bot_reaction_events[emoji] = str(reaction_event_id)
             except Exception as exc:
-                logger.debug("Matrix: failed to add model picker reaction %s: %s", emoji, exc)
+                logger.debug(
+                    "Matrix: failed to add model picker reaction %s (%s)",
+                    emoji,
+                    type(exc).__name__,
+                )
 
         return result
 
@@ -2853,7 +3657,11 @@ class MatrixAdapter(BasePlatformAdapter):
                 if reaction_event_id:
                     prompt.bot_reaction_events[emoji] = str(reaction_event_id)
             except Exception as exc:
-                logger.debug("Matrix: failed to add choice picker reaction %s: %s", emoji, exc)
+                logger.debug(
+                    "Matrix: failed to add choice picker reaction %s (%s)",
+                    emoji,
+                    type(exc).__name__,
+                )
 
         return result
 
@@ -2880,7 +3688,40 @@ class MatrixAdapter(BasePlatformAdapter):
         is_voice: bool = False,
         voice_metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
+        lifecycle_token = self._capture_lifecycle_token()
+        async with self._matrix_lifecycle_lock:
+            self._assert_lifecycle_token(lifecycle_token)
+            return await self._upload_and_send_locked(
+                room_id,
+                data,
+                filename,
+                content_type,
+                msgtype,
+                caption,
+                reply_to,
+                metadata,
+                is_voice,
+                voice_metadata,
+                lifecycle_token,
+            )
+
+    async def _upload_and_send_locked(
+        self,
+        room_id: str,
+        data: bytes,
+        filename: str,
+        content_type: str,
+        msgtype: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        is_voice: bool = False,
+        voice_metadata: Optional[Dict[str, Any]] = None,
+        lifecycle_token: Optional[tuple[int, bool]] = None,
+    ) -> SendResult:
         """Upload bytes to Matrix and send as a media message."""
+        token = lifecycle_token or self._capture_lifecycle_token()
+        self._assert_lifecycle_token(token)
         if len(data) > self._max_media_bytes:
             return SendResult(
                 success=False,
@@ -2889,32 +3730,58 @@ class MatrixAdapter(BasePlatformAdapter):
 
         upload_data = data
         encrypted_file = None
-        if self._encryption and getattr(self._client, "crypto", None):
-            state_store = getattr(self._client, "state_store", None)
-            if state_store:
+        try:
+            room_encrypted = await asyncio.wait_for(
+                self._room_is_encrypted(room_id),
+                timeout=getattr(self, "_matrix_request_timeout_seconds", 45.0),
+            )
+            if room_encrypted:
+                # Establish the room-key share before uploading any media bytes.
+                await asyncio.wait_for(
+                    self._ensure_encrypted_room_ready(room_id),
+                    timeout=getattr(self, "_matrix_request_timeout_seconds", 45.0),
+                )
                 try:
-                    room_encrypted = bool(await state_store.is_encrypted(RoomID(room_id)))
-                except Exception:
-                    room_encrypted = False
-                if room_encrypted:
-                    try:
-                        from mautrix.crypto.attachments import encrypt_attachment
-                        upload_data, encrypted_file = encrypt_attachment(data)
-                    except Exception as exc:
-                        logger.error("Matrix: attachment encryption failed: %s", exc)
-                        return SendResult(success=False, error=str(exc))
+                    from mautrix.crypto.attachments import encrypt_attachment
+                    upload_data, encrypted_file = encrypt_attachment(data)
+                except Exception as exc:
+                    logger.error(
+                        "Matrix: attachment encryption failed (%s)",
+                        type(exc).__name__,
+                    )
+                    return SendResult(
+                        success=False,
+                        error=_matrix_exception_summary(exc),
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "Matrix: media E2EE readiness failed (%s)",
+                type(exc).__name__,
+            )
+            return SendResult(
+                success=False,
+                error=_matrix_exception_summary(exc),
+            )
 
         # Upload to homeserver.
         try:
-            mxc_url = await self._client.upload_media(
-                upload_data,
-                mime_type=content_type,
-                filename=filename,
-                size=len(upload_data),
+            mxc_url = await asyncio.wait_for(
+                self._client.upload_media(
+                    upload_data,
+                    mime_type=content_type,
+                    filename=filename,
+                    size=len(upload_data),
+                ),
+                timeout=getattr(self, "_media_upload_timeout_seconds", 120.0),
             )
         except Exception as exc:
-            logger.error("Matrix: upload failed: %s", exc)
-            return SendResult(success=False, error=str(exc))
+            logger.error("Matrix: upload failed (%s)", type(exc).__name__)
+            return SendResult(
+                success=False,
+                error=_matrix_exception_summary(exc),
+            )
 
         # Build media message content.
         msg_content: Dict[str, Any] = {
@@ -2950,14 +3817,18 @@ class MatrixAdapter(BasePlatformAdapter):
         self._apply_relation_metadata(msg_content, reply_to=reply_to, metadata=metadata)
 
         try:
-            event_id = await self._client.send_message_event(
-                RoomID(room_id),
+            event_id = await self._send_room_event_locked(
+                room_id,
                 EventType.ROOM_MESSAGE,
                 msg_content,
+                lifecycle_token=token,
             )
             return SendResult(success=True, message_id=str(event_id))
         except Exception as exc:
-            return SendResult(success=False, error=str(exc))
+            return SendResult(
+                success=False,
+                error=_matrix_exception_summary(exc),
+            )
 
     async def _send_local_file(
         self,
@@ -3070,7 +3941,10 @@ class MatrixAdapter(BasePlatformAdapter):
                     try:
                         await self._dispatch_sync(sync_data)
                     except Exception as exc:
-                        logger.warning("Matrix: sync event dispatch error: %s", exc)
+                        logger.warning(
+                            "Matrix: sync event dispatch error (%s)",
+                            type(exc).__name__,
+                        )
                     self._schedule_pending_invite_joins(sync_data)
                     # Let freshly scheduled invite joins start before the next
                     # sync iteration without waiting for slow or stuck joins.
@@ -3090,10 +3964,14 @@ class MatrixAdapter(BasePlatformAdapter):
                     or "forbidden" in err_str
                 ):
                     logger.error(
-                        "Matrix: permanent auth error: %s — stopping sync", exc
+                        "Matrix: permanent auth error (%s) — stopping sync",
+                        type(exc).__name__,
                     )
                     return
-                logger.warning("Matrix: sync error: %s — retrying in 5s", exc)
+                logger.warning(
+                    "Matrix: sync error (%s) — retrying in 5s",
+                    type(exc).__name__,
+                )
                 await asyncio.sleep(5)
 
     # ------------------------------------------------------------------
@@ -3199,9 +4077,9 @@ class MatrixAdapter(BasePlatformAdapter):
             return await self._is_dm_room(room_id)
         except Exception as exc:
             logger.debug(
-                "Matrix: could not resolve room identity for allowlist check in %s: %s",
+                "Matrix: could not resolve room identity for allowlist check in %s (%s)",
                 room_id,
-                exc,
+                type(exc).__name__,
             )
             return False
 
@@ -3820,36 +4698,62 @@ class MatrixAdapter(BasePlatformAdapter):
             inviter=inviter,
         )
 
-    async def _join_room_by_id(self, room_id: str) -> bool:
+    async def _join_room_by_id(
+        self,
+        room_id: str,
+        *,
+        lifecycle_token: Optional[tuple[int, bool]] = None,
+    ) -> bool:
         """Join a room by ID and refresh local caches on success."""
         if not room_id:
             return False
-        if room_id in self._joined_rooms:
-            return True
-        try:
-            await self._client.join_room(RoomID(room_id))
-            self._joined_rooms.add(room_id)
-            self._room_identities.pop(room_id, None)
-            self._room_identity_cached_at.pop(room_id, None)
-            logger.info("Matrix: joined %s", room_id)
-            await self._refresh_dm_cache()
-            return True
-        except Exception as exc:
-            logger.warning("Matrix: error joining %s: %s", room_id, exc)
-            # Abandoned rooms (no current members) surface as "no servers
-            # in the room have been provided" or "room not found". The
-            # pending invite keeps retrying every startup unless we
-            # explicitly leave it. The match is narrow enough that
-            # transient failures still leave the invite untouched for the
-            # next try.
-            msg = str(exc).lower()
-            if ("no servers" in msg) or ("room not found" in msg):
-                try:
-                    await self._client.leave_room(RoomID(room_id))
-                    logger.info("Matrix: declined dead invite to %s", room_id)
-                except Exception:
-                    pass
-            return False
+        token = lifecycle_token or self._capture_lifecycle_token()
+        async with self._matrix_lifecycle_lock:
+            self._assert_lifecycle_token(token)
+            if room_id in self._joined_rooms:
+                return True
+            try:
+                await asyncio.wait_for(
+                    self._client.join_room(RoomID(room_id)),
+                    timeout=getattr(self, "_matrix_request_timeout_seconds", 45.0),
+                )
+                self._assert_lifecycle_token(token)
+                self._joined_rooms.add(room_id)
+                self._room_identities.pop(room_id, None)
+                self._room_identity_cached_at.pop(room_id, None)
+                logger.info("Matrix: joined %s", room_id)
+                await asyncio.wait_for(
+                    self._refresh_dm_cache(),
+                    timeout=getattr(self, "_matrix_request_timeout_seconds", 45.0),
+                )
+                return True
+            except Exception as exc:
+                logger.warning(
+                    "Matrix: error joining %s (%s)",
+                    room_id,
+                    type(exc).__name__,
+                )
+                # Abandoned rooms (no current members) surface as "no servers
+                # in the room have been provided" or "room not found". The
+                # pending invite keeps retrying every startup unless we
+                # explicitly leave it. The match is narrow enough that
+                # transient failures still leave the invite untouched for the
+                # next try.
+                msg = str(exc).lower()
+                if ("no servers" in msg) or ("room not found" in msg):
+                    try:
+                        await asyncio.wait_for(
+                            self._client.leave_room(RoomID(room_id)),
+                            timeout=getattr(
+                                self,
+                                "_matrix_request_timeout_seconds",
+                                45.0,
+                            ),
+                        )
+                        logger.info("Matrix: declined dead invite to %s", room_id)
+                    except Exception:
+                        pass
+                return False
 
     def _schedule_invite_join(
         self,
@@ -3866,16 +4770,54 @@ class MatrixAdapter(BasePlatformAdapter):
             return
 
         async def _join_invite() -> None:
+            lifecycle_token = self._capture_lifecycle_token()
             try:
-                joined = await asyncio.wait_for(
-                    self._join_room_by_id(room_id), timeout=45.0
+                join_kwargs = (
+                    {"lifecycle_token": lifecycle_token}
+                    if lifecycle_token[1]
+                    else {}
                 )
-                # Persist the DM signal from the invite once the join lands,
-                # so m.direct is authoritative even on a fresh bot account.
-                if joined and is_direct and inviter:
-                    await self._record_dm_room(room_id, inviter)
+                joined = await asyncio.wait_for(
+                    self._join_room_by_id(room_id, **join_kwargs),
+                    timeout=getattr(
+                        self,
+                        "_matrix_request_timeout_seconds",
+                        45.0,
+                    ),
+                )
+                if joined:
+                    async with self._matrix_lifecycle_lock:
+                        self._assert_lifecycle_token(lifecycle_token)
+                        # Persist the DM signal from the invite once the join
+                        # lands, so m.direct is authoritative on fresh accounts.
+                        if is_direct and inviter:
+                            await asyncio.wait_for(
+                                self._record_dm_room(room_id, inviter),
+                                timeout=getattr(
+                                    self,
+                                    "_matrix_request_timeout_seconds",
+                                    45.0,
+                                ),
+                            )
+                        if self._encryption:
+                            await asyncio.wait_for(
+                                self._ensure_encrypted_room_ready(room_id),
+                                timeout=getattr(
+                                    self,
+                                    "_matrix_request_timeout_seconds",
+                                    45.0,
+                                ),
+                            )
             except asyncio.TimeoutError:
                 logger.warning("Matrix: timed out joining invite %s", room_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Matrix: invite join task failed for %s (%s)",
+                    room_id,
+                    type(exc).__name__,
+                )
             finally:
                 self._invite_join_tasks.pop(room_id, None)
 
@@ -3917,15 +4859,15 @@ class MatrixAdapter(BasePlatformAdapter):
             }
         }
         try:
-            resp_event_id = await self._client.send_message_event(
-                RoomID(room_id),
+            resp_event_id = await self._send_room_event(
+                room_id,
                 EventType.REACTION,
                 content,
             )
             logger.debug("Matrix: sent reaction %s to %s", emoji, event_id)
             return str(resp_event_id)
         except Exception as exc:
-            logger.debug("Matrix: reaction send error: %s", exc)
+            logger.debug("Matrix: reaction send error (%s)", type(exc).__name__)
             return None
 
     async def _redact_reaction(
@@ -3957,9 +4899,9 @@ class MatrixAdapter(BasePlatformAdapter):
                 raise
             except Exception as exc:
                 logger.debug(
-                    "Matrix: delayed reaction redaction failed for %s: %s",
+                    "Matrix: delayed reaction redaction failed for %s (%s)",
                     reaction_event_id,
-                    exc,
+                    type(exc).__name__,
                 )
 
         task = asyncio.create_task(_redact_later())
@@ -4074,7 +5016,10 @@ class MatrixAdapter(BasePlatformAdapter):
                         # Redact bot's seed reactions, leaving only the user's
                         await self._redact_bot_approval_reactions(room_id, prompt)
                 except Exception as exc:
-                    logger.error("Failed to resolve gateway approval from Matrix reaction: %s", exc)
+                    logger.error(
+                        "Failed to resolve gateway approval from Matrix reaction (%s)",
+                        type(exc).__name__,
+                    )
                 return
 
             model_prompt = self._model_picker_prompts_by_event.get(reacts_to)
@@ -4107,10 +5052,13 @@ class MatrixAdapter(BasePlatformAdapter):
                     if confirmation:
                         await self.send(room_id, confirmation, reply_to=reacts_to)
                 except Exception as exc:
-                    logger.error("Failed to switch model from Matrix reaction: %s", exc)
+                    logger.error(
+                        "Failed to switch model from Matrix reaction (%s)",
+                        type(exc).__name__,
+                    )
                     await self.send(
                         room_id,
-                        f"Failed to switch model: {exc}",
+                        f"Failed to switch model: {_matrix_exception_summary(exc)}",
                         reply_to=reacts_to,
                     )
                 return
@@ -4141,10 +5089,13 @@ class MatrixAdapter(BasePlatformAdapter):
                     if confirmation:
                         await self.send(room_id, confirmation, reply_to=reacts_to)
                 except Exception as exc:
-                    logger.error("Failed to apply choice from Matrix reaction: %s", exc)
+                    logger.error(
+                        "Failed to apply choice from Matrix reaction (%s)",
+                        type(exc).__name__,
+                    )
                     await self.send(
                         room_id,
-                        f"Failed to apply selection: {exc}",
+                        f"Failed to apply selection: {_matrix_exception_summary(exc)}",
                         reply_to=reacts_to,
                     )
                 return
@@ -4204,7 +5155,10 @@ class MatrixAdapter(BasePlatformAdapter):
         try:
             await self.send(room_id, text, reply_to=target_event_id)
         except Exception as exc:
-            logger.debug("Matrix: failed to send invalid reaction feedback: %s", exc)
+            logger.debug(
+                "Matrix: failed to send invalid reaction feedback (%s)",
+                type(exc).__name__,
+            )
 
     async def _expire_matrix_approval_prompt(
         self,
@@ -4258,7 +5212,11 @@ class MatrixAdapter(BasePlatformAdapter):
                 await self.redact_message(room_id, evt_id, "model picker resolved")
                 logger.debug("Matrix: redacted model picker reaction %s (%s)", emoji, evt_id)
             except Exception as exc:
-                logger.debug("Matrix: failed to redact model picker reaction %s: %s", emoji, exc)
+                logger.debug(
+                    "Matrix: failed to redact model picker reaction %s (%s)",
+                    emoji,
+                    type(exc).__name__,
+                )
 
     # ------------------------------------------------------------------
     # Text message aggregation (handles Matrix client-side splits)
@@ -4339,7 +5297,10 @@ class MatrixAdapter(BasePlatformAdapter):
             try:
                 await self.send_read_receipt(room_id, event_id)
             except Exception as exc:  # pragma: no cover — defensive
-                logger.debug("Matrix: background read receipt failed: %s", exc)
+                logger.debug(
+                    "Matrix: background read receipt failed (%s)",
+                    type(exc).__name__,
+                )
 
         asyncio.ensure_future(_send())
 
@@ -4366,7 +5327,7 @@ class MatrixAdapter(BasePlatformAdapter):
             logger.debug("Matrix: sent read receipt for %s in %s", event_id, room_id)
             return True
         except Exception as exc:
-            logger.debug("Matrix: read receipt failed: %s", exc)
+            logger.debug("Matrix: read receipt failed (%s)", type(exc).__name__)
             return False
 
     # ------------------------------------------------------------------
@@ -4382,17 +5343,36 @@ class MatrixAdapter(BasePlatformAdapter):
         """Redact (delete) a message or event from a room."""
         if not self._client:
             return False
-        try:
-            await self._client.redact(
-                RoomID(room_id),
-                EventID(event_id),
-                reason=reason or None,
-            )
-            logger.info("Matrix: redacted %s in %s", event_id, room_id)
-            return True
-        except Exception as exc:
-            logger.warning("Matrix: redact error: %s", exc)
-            return False
+        lifecycle_token = self._capture_lifecycle_token()
+        async with self._matrix_lifecycle_lock:
+            self._assert_lifecycle_token(lifecycle_token)
+            if (
+                getattr(self, "_matrix_client_runtime_bound", False)
+                and (
+                    not self._matrix_client_lifecycle_active
+                    or not self._matrix_client_connected
+                    or self._client is None
+                )
+            ):
+                return False
+            try:
+                await asyncio.wait_for(
+                    self._client.redact(
+                        RoomID(room_id),
+                        EventID(event_id),
+                        reason=reason or None,
+                    ),
+                    timeout=getattr(
+                        self,
+                        "_matrix_request_timeout_seconds",
+                        45.0,
+                    ),
+                )
+                logger.info("Matrix: redacted %s in %s", event_id, room_id)
+                return True
+            except Exception as exc:
+                logger.warning("Matrix: redact error (%s)", type(exc).__name__)
+                return False
 
     # ------------------------------------------------------------------
     # Room creation & management
@@ -4435,20 +5415,39 @@ class MatrixAdapter(BasePlatformAdapter):
             logger.info("Matrix: created room %s (%s)", room_id_str, name or "unnamed")
             return room_id_str
         except Exception as exc:
-            logger.warning("Matrix: create_room error: %s", exc)
+            logger.warning("Matrix: create_room error (%s)", type(exc).__name__)
             return None
 
     async def invite_user(self, room_id: str, user_id: str) -> bool:
-        """Invite a user to a room."""
+        """Invite a user to a room under the Matrix lifecycle fence."""
         if not self._client:
             return False
-        try:
-            await self._client.invite_user(RoomID(room_id), UserID(user_id))
-            logger.info("Matrix: invited %s to %s", user_id, room_id)
-            return True
-        except Exception as exc:
-            logger.warning("Matrix: invite error: %s", exc)
-            return False
+        lifecycle_token = self._capture_lifecycle_token()
+        async with self._matrix_lifecycle_lock:
+            self._assert_lifecycle_token(lifecycle_token)
+            if (
+                getattr(self, "_matrix_client_runtime_bound", False)
+                and (
+                    not self._matrix_client_lifecycle_active
+                    or not self._matrix_client_connected
+                    or self._client is None
+                )
+            ):
+                return False
+            try:
+                await asyncio.wait_for(
+                    self._client.invite_user(RoomID(room_id), UserID(user_id)),
+                    timeout=getattr(
+                        self,
+                        "_matrix_request_timeout_seconds",
+                        45.0,
+                    ),
+                )
+                logger.info("Matrix: invited %s to %s", user_id, room_id)
+                return True
+            except Exception as exc:
+                logger.warning("Matrix: invite error (%s)", type(exc).__name__)
+                return False
 
     async def fetch_history(
         self,
@@ -4484,7 +5483,7 @@ class MatrixAdapter(BasePlatformAdapter):
                 chunk = response.get("chunk")
             return [self._serialize_history_event(evt) for evt in (chunk or [])]
         except Exception as exc:
-            logger.warning("Matrix: fetch history error: %s", exc)
+            logger.warning("Matrix: fetch history error (%s)", type(exc).__name__)
             return []
 
     def _serialize_history_event(self, event: Any) -> dict[str, Any]:
@@ -4533,7 +5532,7 @@ class MatrixAdapter(BasePlatformAdapter):
             logger.debug("Matrix: presence set to %s", state)
             return True
         except Exception as exc:
-            logger.debug("Matrix: set_presence failed: %s", exc)
+            logger.debug("Matrix: set_presence failed (%s)", type(exc).__name__)
             return False
 
     # ------------------------------------------------------------------
@@ -4553,14 +5552,17 @@ class MatrixAdapter(BasePlatformAdapter):
         msg_content = self._build_text_message_content(text, msgtype=msgtype)
 
         try:
-            event_id = await self._client.send_message_event(
-                RoomID(chat_id),
+            event_id = await self._send_room_event(
+                chat_id,
                 EventType.ROOM_MESSAGE,
                 msg_content,
             )
             return SendResult(success=True, message_id=str(event_id))
         except Exception as exc:
-            return SendResult(success=False, error=str(exc))
+            return SendResult(
+                success=False,
+                error=_matrix_exception_summary(exc),
+            )
 
     # ------------------------------------------------------------------
     # Helpers
@@ -4750,7 +5752,10 @@ class MatrixAdapter(BasePlatformAdapter):
             elif isinstance(resp, dict):
                 dm_data = resp
         except Exception as exc:
-            logger.debug("Matrix: get_account_data('m.direct') failed: %s", exc)
+            logger.debug(
+                "Matrix: get_account_data('m.direct') failed (%s)",
+                type(exc).__name__,
+            )
 
         if dm_data is None:
             return
@@ -4798,7 +5803,10 @@ class MatrixAdapter(BasePlatformAdapter):
                     "Matrix: recorded %s as DM room (inviter=%s)", room_id, inviter
                 )
             except Exception as exc:
-                logger.warning("Matrix: failed to update m.direct: %s", exc)
+                logger.warning(
+                    "Matrix: failed to update m.direct (%s)",
+                    type(exc).__name__,
+                )
 
         # Update local cache so _resolve_room_identity sees it immediately.
         self._dm_rooms[room_id] = True
@@ -5253,10 +6261,50 @@ async def _standalone_send(
         # invoked via asyncio.run_coroutine_threadsafe() from cron jobs.
         async with aiohttp.ClientSession() as session:
             async def _do_send():
+                state_url = (
+                    f"{homeserver}/_matrix/client/v3/rooms/{encoded_room}"
+                    "/state/m.room.encryption"
+                )
+                async with session.get(state_url, headers=headers) as state_resp:
+                    if state_resp.status == 404:
+                        try:
+                            error_body = await state_resp.json()
+                        except Exception:
+                            return {"error": "Matrix room encryption state was invalid"}
+                        if (
+                            not isinstance(error_body, dict)
+                            or error_body.get("errcode") != "M_NOT_FOUND"
+                        ):
+                            return {
+                                "error": (
+                                    "Matrix room encryption-state inspection failed "
+                                    "(invalid 404 response)"
+                                )
+                            }
+                    elif state_resp.status != 200:
+                        return {
+                            "error": (
+                                f"Matrix room encryption-state inspection failed "
+                                f"({state_resp.status})"
+                            )
+                        }
+                    else:
+                        try:
+                            state = await state_resp.json()
+                        except Exception:
+                            return {"error": "Matrix room encryption state was invalid"}
+                        if state.get("algorithm"):
+                            return {
+                                "error": (
+                                    "Matrix standalone delivery refuses encrypted rooms; "
+                                    "use the running gateway for E2EE"
+                                )
+                            }
+                        return {"error": "Matrix room encryption state was invalid"}
+
                 async with session.put(url, headers=headers, json=payload) as resp:
                     if resp.status not in {200, 201}:
-                        body = await resp.text()
-                        return {"error": f"Matrix API error ({resp.status}): {body}"}
+                        return {"error": f"Matrix API error ({resp.status})"}
                     data = await resp.json()
                     return {"success": True, "platform": "matrix", "chat_id": chat_id, "message_id": data.get("event_id")}
             try:
@@ -5264,7 +6312,7 @@ async def _standalone_send(
             except asyncio.TimeoutError:
                 return {"error": "Matrix API timeout (30s)"}
     except Exception as e:
-        return {"error": f"Matrix send failed: {e}"}
+        return {"error": f"Matrix send failed: {_matrix_exception_summary(e)}"}
 
 
 def interactive_setup() -> None:
@@ -5333,7 +6381,7 @@ def interactive_setup() -> None:
                         "Install failed — run manually: pip install "
                         "'mautrix[encryption]' asyncpg aiosqlite Markdown aiohttp-socks"
                     )
-                    print_info(f"  Error: {exc}")
+                    print_info(f"  Error: {_matrix_exception_summary(exc)}")
         except ImportError:
             try:
                 __import__("mautrix")
@@ -5410,6 +6458,8 @@ def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
         os.environ["MATRIX_DM_MENTION_THREADS"] = str(matrix_cfg["dm_mention_threads"]).lower()
     if "max_message_length" in matrix_cfg and not os.getenv("MATRIX_MAX_MESSAGE_LENGTH"):
         os.environ["MATRIX_MAX_MESSAGE_LENGTH"] = str(matrix_cfg["max_message_length"])
+    if "device_refresh_seconds" in matrix_cfg and not os.getenv("MATRIX_DEVICE_REFRESH_SECONDS"):
+        os.environ["MATRIX_DEVICE_REFRESH_SECONDS"] = str(matrix_cfg["device_refresh_seconds"])
     return None
 
 
