@@ -1605,12 +1605,34 @@ class MatrixAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _extract_server_ed25519(device_keys_obj: Any) -> Optional[str]:
-        """Extract the ed25519 identity key from a DeviceKeys object."""
-        for kid, kval in (getattr(device_keys_obj, "keys", {}) or {}).items():
-            if str(kid).startswith("ed25519:"):
-                return str(kval)
+    def _extract_server_device_key(
+        device_keys_obj: Any, algorithm: str
+    ) -> Optional[str]:
+        """Extract a device identity key from a Mautrix DeviceKeys object.
+
+        Mautrix stores ``DeviceKeys.keys`` under typed ``KeyID`` objects, not
+        plain strings. Compare their serialized IDs rather than indexing with
+        plain strings, and retain a property fallback for older SDKs.
+        """
+        keys = getattr(device_keys_obj, "keys", {}) or {}
+        if isinstance(keys, dict):
+            for kid, kval in keys.items():
+                if str(kid).startswith(f"{algorithm}:") and kval:
+                    return str(kval)
+            return None
+
+        # Older SDK-compatible objects may expose typed properties without a
+        # normal ``keys`` mapping. Avoid blindly reading dynamic attributes
+        # from test doubles such as MagicMock.
+        direct = getattr(device_keys_obj, algorithm, None)
+        if direct and not inspect.isroutine(direct):
+            return str(direct)
         return None
+
+    @classmethod
+    def _extract_server_ed25519(cls, device_keys_obj: Any) -> Optional[str]:
+        """Extract the ed25519 identity key from a DeviceKeys object."""
+        return cls._extract_server_device_key(device_keys_obj, "ed25519")
 
     async def _reverify_keys_after_upload(
         self, client: Any, local_ed25519: str
@@ -2656,10 +2678,13 @@ class MatrixAdapter(BasePlatformAdapter):
                     self._e2ee_room_targets.pop(room_id, None)
                     raise RuntimeError(f"Matrix device refresh returned no devices for {user_id}")
                 for device_id, device_keys in devices.items():
-                    keys = getattr(device_keys, "keys", {}) or {}
-                    if not keys.get(f"curve25519:{device_id}") or not keys.get(
-                        f"ed25519:{device_id}"
-                    ):
+                    curve25519 = self._extract_server_device_key(
+                        device_keys, "curve25519"
+                    )
+                    ed25519 = self._extract_server_device_key(
+                        device_keys, "ed25519"
+                    )
+                    if not curve25519 or not ed25519:
                         self._device_refresh_ts.pop(room_id, None)
                         self._e2ee_room_targets.pop(room_id, None)
                         raise RuntimeError(

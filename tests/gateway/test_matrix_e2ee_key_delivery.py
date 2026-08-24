@@ -25,6 +25,24 @@ IDENTITY_KEY = "curve25519:alice"
 TARGET = (str(PEER), DEVICE, IDENTITY_KEY)
 
 
+class _TypedKeyID:
+    """Small stand-in for mautrix.types.KeyID.
+
+    It deliberately does not compare equal to a plain string, matching the
+    installed Mautrix representation and catching string-key dict lookups.
+    """
+
+    def __init__(self, algorithm, key_id):
+        self.algorithm = algorithm
+        self.key_id = key_id
+
+    def __str__(self):
+        return f"{self.algorithm}:{self.key_id}"
+
+    def __hash__(self):
+        return hash((self.algorithm, self.key_id))
+
+
 class FakeSession:
     expired = False
     shared = True
@@ -100,8 +118,8 @@ class FakeClient:
                     PEER: {
                         DEVICE: SimpleNamespace(
                             keys={
-                                f"curve25519:{DEVICE}": IDENTITY_KEY,
-                                f"ed25519:{DEVICE}": "ed25519:alice",
+                                _TypedKeyID("curve25519", DEVICE): IDENTITY_KEY,
+                                _TypedKeyID("ed25519", DEVICE): "ed25519:alice",
                             }
                         )
                     }
