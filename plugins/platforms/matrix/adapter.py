@@ -2879,9 +2879,10 @@ class MatrixAdapter(BasePlatformAdapter):
             except Exception as exc:
                 success = False
                 logger.error(
-                    "Matrix: encrypted-room key reconciliation failed for %s (%s)",
+                    "Matrix: encrypted-room key reconciliation failed for %s (%s): %s",
                     room_id,
                     type(exc).__name__,
+                    _matrix_exception_summary(exc),
                 )
         return success
 
